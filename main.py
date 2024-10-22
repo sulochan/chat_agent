@@ -1,12 +1,18 @@
-from uuid import uuid4
-from fastapi import FastAPI, Form, Request
+from typing import List, Dict
+import json
 import asyncio
 import random
+from datetime import datetime
+from uuid import uuid4
+from fastapi import FastAPI, Form, Request, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import json
+from auth import get_current_user, get_user
+from schemas import User, Message
+from bot import chat
 
 app = FastAPI()
+
 
 # Enable CORS to allow all origins
 app.add_middleware(
@@ -17,12 +23,10 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-messages = []
-message_queue = asyncio.Queue()
-active_connections = []  # List to track active connections
+messages: Dict[str, List[Message]] = {}
+message_queues: Dict[str, asyncio.Queue] = {}
+
 CHATBOT_UUID = "2b5b3f75-8df6-11ef-99ad-67b363642d9b"
-USER_UUID = "94066bf6-0172-4102-9c94-328608f82f42"
-USER_API_KEY = "c5630cc2-86a9-433e-9d25-e5d6ad4f29b1"
 CHATBOT_RESPONSES = [
     "Hello! How can I assist you today?",
     "I'm here to help. What do you need?",
@@ -36,21 +40,25 @@ CHATBOT_RESPONSES = [
 
 
 @app.get("/api/chatbot")
-def chatbot_messages():
-    return messages
+def chatbot_messages(user: User = Depends(get_current_user)):
+    return messages.get(user.uuid, [])
 
 
 @app.post("/api/chatbot")
-async def send_message(body: str = Form(...)):
-    message = {
-        "uuid": str(uuid4()),
-        "body": body,
-        "to": CHATBOT_UUID,
-        "from": USER_UUID,
-        "created_at": "2021-10-01T12:00:00Z",
-    }
+async def send_message(body: str = Form(...), user: User = Depends(get_current_user)):
+    message = Message(
+        uuid=str(uuid4()),
+        body=body,
+        to=CHATBOT_UUID,
+        from_=user.uuid,
+        created_at=datetime.now().isoformat(),
+    )
 
-    messages.append(message)
+    # Add the user message to the messages list
+    if user.uuid not in messages:
+        messages[user.uuid] = []
+
+    messages[user.uuid].append(message)
 
     # Schedule the chatbot response to run independently
     asyncio.create_task(get_chatbot_response(message))
@@ -60,54 +68,67 @@ async def send_message(body: str = Form(...)):
 
 @app.get("/api/stream")
 async def stream_messages(request: Request):
-    # Add the connection to the active connections list
-    event_generator = event_stream(request)
+    x_api_key = request.query_params.get("X-API-Key")
+    x_uuid_key = request.query_params.get("X-USER-UUID")
+
+    if not x_api_key or not x_uuid_key:
+        return {"error": "Missing x-api-key or x-uuid-key"}
+
+    user = get_user(x_uuid_key, x_api_key)
+
+    event_generator = event_stream(user)
+
     return StreamingResponse(event_generator, media_type="text/event-stream")
 
 
-@app.get("/api/stats")
-def get_stats():
-    return {
-        "total_messages": len(messages),
-        "active_connections": len(active_connections),
-    }
+async def event_stream(user: User):
+    while True:
+        # Create a new asyncio Queue for the user if it doesn't exist
+        if user.uuid not in message_queues:
+            message_queues[user.uuid] = asyncio.Queue()
+
+        # Get the message queue for the user
+        message_queue = message_queues[user.uuid]
+
+        # Wait for a new message to be added to the queue
+        message = await message_queue.get()
+        if message:
+            try:
+                # Send the message to the SSE client
+                yield f"data: {json.dumps(message)}\n\n"
+            except Exception as e:
+                print(f"Error sending message: {e}")
 
 
-async def event_stream(request: Request):
-    global active_connections
-    # Register the new connection
-    active_connections.append(request)
+async def get_chatbot_response(message: Message) -> Message:
+    # Generate a "thinking" message to indicate that the chatbot is processing
+    queue: asyncio.Queue = message_queues.get(message.from_, None)
 
-    try:
-        while True:
-            message = await message_queue.get()
-            if message:
-                try:
-                    # Send the message to the SSE client
-                    yield f"data: {json.dumps(message)}\n\n"
-                except Exception as e:
-                    print(f"Error sending message: {e}")
-    finally:
-        # Clean up when the connection is closed
-        active_connections.remove(request)
+    if queue:
+        await queue.put({"thinking": True})
 
+    bot_response = await chat(message.body)
 
-async def get_chatbot_response(message):
-    await message_queue.put({"thinking": True})
+    print("Bot response:", bot_response)
 
-    await asyncio.sleep(3)  # Simulate delay
-
+    # TODO: Extract the response message from the bot_response and replace the random choice
     choice = random.choice(CHATBOT_RESPONSES)
+    response = Message(
+        uuid=str(uuid4()),
+        body=choice,
+        to=message.from_,
+        from_=CHATBOT_UUID,
+        created_at=datetime.now().isoformat(),
+    )
 
-    response = {
-        "uuid": str(uuid4()),
-        "body": choice,
-        "to": USER_UUID,
-        "from": CHATBOT_UUID,
-        "created_at": "2021-10-01T12:00:00Z",
-    }
+    # Add the chatbot response to the messages list
+    if message.from_ not in messages:
+        messages[message.from_] = []
 
-    messages.append(response)
-    await message_queue.put(response)  # Notify that the response is ready
+    messages[message.from_].append(response)
+
+    # Notify the event stream that a new message is available
+    if queue:
+        await queue.put(response.model_dump_json())
 
     return response
